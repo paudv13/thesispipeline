@@ -1,0 +1,864 @@
+---
+output:
+  html_document: default
+  word_document: default
+---
+###DADA2 Pipeline Tutorial (1.16)
+This workflow assumes that your sequencing data meets certain criteria:
+
+    Samples have been demultiplexed, i.e. split into individual per-sample fastq files.
+    Non-biological nucleotides have been removed, e.g. primers, adapters, linkers, etc.
+    If paired-end sequencing data, the forward and reverse fastq files contain reads in matched order.
+
+```{r setup, include=FALSE}
+knitr::knit_hooks$set(timeit = local({
+  now = NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res = difftime(Sys.time(), now)
+      now <<- NULL
+      # use options$label if you want the chunk label as well
+      paste('Time for this code chunk:', as.character(res))
+    }
+  }})
+)
+```
+
+##Inspect read quality profiles
+Along with the dada2 library, we also load the ShortRead and the Biostrings package (R Bioconductor packages; can be installed from the following locations, dada2, ShortRead and Biostrings) which will help in identification and count of the primers present on the raw FASTQ sequence files.
+```{r}
+library(dada2); packageVersion("dada2")
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("ShortRead")
+BiocManager::install("Biostrings")
+BiocManager::install("MatrixGenerics")
+library(ShortRead)
+library(Biostrings)
+```
+
+Define the following path variable so that it points to the extracted directory on your machine:
+
+```{r message=TRUE, warning=TRUE, include=FALSE, timeit = TRUE}
+Sys.sleep(2)
+path <- "~/tfm/data/rawdata/" # CHANGE ME to the directory containing the fastq files after unzipping.
+list.files(path)
+```
+
+generate matched lists of the forward and reverse read files, as well as parsing out the sample name. Here we assume forward and reverse read files are in the format SAMPLENAME_1.fastq.gz and SAMPLENAME_2.fastq.gz, respectively, so string parsing may have to be altered in your own data if your filenamess have a different format.
+```{r}
+fnFs <- sort(list.files(path, pattern = "_1.fastq.gz", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern = "_2.fastq.gz", full.names = TRUE))
+```
+
+##Identifying primers
+We record the DNA sequences, including ambiguous nucleotides, for those primers.
+
+```{r, timeit=TRUE}
+Sys.sleep(2)
+FWD <- "GTGYCAGCMGCCGCGGTAA"  ## CHANGE ME to your forward primer sequence
+REV <- "GGACTACNVGGGTWTCTAAT"  ## CHANGE ME...
+```
+
+ we will verify the presence and orientation of these primers in the data.
+```{r}
+allOrients <- function(primer) {
+    # Create all orientations of the input sequence
+    require(Biostrings)
+    dna <- DNAString(primer)  # The Biostrings works w/ DNAString objects rather than character vectors
+    orients <- c(Forward = dna, Complement = Biostrings::complement(dna), Reverse = Biostrings::reverse(dna),
+        RevComp = Biostrings::reverseComplement(dna))
+    return(sapply(orients, toString))  # Convert back to character vector
+}
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+FWD.orients
+```
+
+“pre-filter” the sequences just to remove those with Ns, but perform no other filtering.
+```{r}
+fnFs.filtN <- file.path(path, "filtN", basename(fnFs)) # Put N-filtered files in filtN/ subdirectory
+fnRs.filtN <- file.path(path, "filtN", basename(fnRs))
+filterAndTrim(fnFs, fnFs.filtN, fnRs, fnRs.filtN, maxN = 0, multithread = TRUE)
+```
+
+We are now ready to count the number of times the primers appear in the forward and reverse read, while considering all possible primer orientations. assuming all the files were created using the same library preparation, we’ll just process the first sample.
+```{r}
+primerHits <- function(primer, fn) {
+    # Counts number of reads in which the primer is found
+    nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+    return(sum(nhits > 0))
+}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.filtN[[1]]), FWD.ReverseReads = sapply(FWD.orients,
+    primerHits, fn = fnRs.filtN[[1]]), REV.ForwardReads = sapply(REV.orients, primerHits,
+    fn = fnFs.filtN[[1]]), REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.filtN[[1]]))
+```
+
+These primers can be now removed using cutadapt. After installing cutadapt, we need to tell R the path to the cutadapt command.
+```{r}
+cutadapt<-"/home/paudv/miniconda3/envs/tfm/bin/cutadapt"
+system2(cutadapt, args = "--version") # Run shell commands from R
+```
+
+We now create output filenames for the cutadapt-ed files, and define the parameters we are going to give the cutadapt command. The critical parameters are the primers, and they need to be in the right orientation, i.e. the FWD primer should have been matching the forward-reads in its forward orientation, and the REV primer should have been matching the reverse-reads in its forward orientation. 
+```{r message=TRUE, warning=TRUE, include=FALSE}
+path.cut <- file.path(path, "cutadapt")
+if(!dir.exists(path.cut)) dir.create(path.cut)
+fnFs.cut <- file.path(path.cut, basename(fnFs))
+fnRs.cut <- file.path(path.cut, basename(fnRs))
+
+FWD.RC <- dada2:::rc(FWD)
+REV.RC <- dada2:::rc(REV)
+# Trim FWD and the reverse-complement of REV off of R1 (forward reads)
+R1.flags <- paste("-g", FWD, "-a", REV.RC) 
+# Trim REV and the reverse-complement of FWD off of R2 (reverse reads)
+R2.flags <- paste("-G", REV, "-A", FWD.RC) 
+# Run Cutadapt
+for(i in seq_along(fnFs)) {
+  system2(cutadapt, args = c(R1.flags, R2.flags, "-n", 2, # -n 2 required to remove FWD and REV from reads
+                             "-o", fnFs.cut[i], "-p", fnRs.cut[i], # output files
+                             fnFs.filtN[i], fnRs.filtN[i])) # input files
+}
+
+```
+
+As a sanity check, we will count the presence of primers in the first cutadapt-ed sample:
+```{r}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.cut[[1]]), FWD.ReverseReads = sapply(FWD.orients,
+    primerHits, fn = fnRs.cut[[1]]), REV.ForwardReads = sapply(REV.orients, primerHits,
+    fn = fnFs.cut[[1]]), REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.cut[[1]]))
+```
+
+we read in the names of the cutadapt-ed FASTQ files and applying some string manipulation to get the matched lists of forward and reverse fastq files.
+```{r}
+# Forward and reverse fastq filenames have the format:
+cutFs <- sort(list.files(path.cut, pattern = "_1.fastq.gz", full.names = TRUE))
+cutRs <- sort(list.files(path.cut, pattern = "_2.fastq.gz", full.names = TRUE))
+
+# Extract sample names, assuming filenames have format:
+get.sample.name <- function(fname) strsplit(basename(fname), "_")[[1]][1]
+sample.names <- unname(sapply(cutFs, get.sample.name))
+head(sample.names)
+```
+
+##Inspect read quality profiles
+
+```{r}
+plotQualityProfile(fnFs[1:2])
+```
+```{r}
+plotQualityProfile(fnRs[1:2])
+
+```
+
+##Filter and trim
+
+Assigning the filenames for the output of the filtered reads to be stored as fastq.gz files.
+```{r}
+filtFs <- file.path(path.cut, "filtered", basename(cutFs))
+filtRs <- file.path(path.cut, "filtered", basename(cutRs))
+```
+
+For this dataset, we will use  maxN=0 (DADA2 requires sequences contain no Ns), truncQ = 5, truncLen = c(230, 200), and trimLeft = c(10, 10).
+```{r}
+out <- filterAndTrim(cutFs, filtFs, cutRs, filtRs, maxN = 0, truncQ = 5, truncLen = c(230, 200), trimLeft = c(10, 10), rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE)  
+head(out)
+```
+
+##Learn the Error Rates
+
+The DADA2 algorithm makes use of a parametric error model (err) and every amplicon dataset has a different set of error rates. As in many machine-learning problems, the algorithm must begin with an initial guess, for which the maximum possible error rates in this data are used (the error rates if only the most abundant sequence is correct and all the rest are errors).
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+
+plotErrors(errF, nominalQ=TRUE)
+```
+The error rates for each possible transition (A→C, A→G, …) are shown. Points are the observed error rates for each consensus quality score. The black line shows the estimated error rates after convergence of the machine-learning algorithm. The red line shows the error rates expected under the nominal definition of the Q-score. Here the estimated error rates (black line) are a good fit to the observed rates (points), and the error rates drop with increased quality as expected. Everything looks reasonable and we proceed with confidence.
+
+##Sample Inference
+apply the core sample inference algorithm to the filtered and trimmed sequence data.
+
+```{r message=TRUE, warning=TRUE, include=FALSE}
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+dadaFs[[1]]
+```
+
+##Merge paired reads
+
+Merging is performed by aligning the denoised forward reads with the reverse-complement of the corresponding denoised reverse reads, and then constructing the merged “contig” sequences. By default, merged sequences are only output if the forward and reverse reads overlap by at least 12 bases, and are identical to each other in the overlap region
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+The mergers object is a list of data.frames from each sample. Each data.frame contains the merged $sequence, its $abundance, and the indices of the $forward and $reverse sequence variants that were merged. Paired reads that did not exactly overlap were removed by mergePairs, further reducing spurious output.
+
+##Construct sequence table
+
+We can now construct an amplicon sequence variant table (ASV) table, a higher-resolution version of the OTU table produced by traditional methods.
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+```
+The sequence table is a matrix with rows corresponding to (and named by) the samples, and columns corresponding to (and named by) the sequence variants.
+```{r}
+#You can remove non-target-length sequences from your sequence table 
+#seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% 250:256])
+```
+
+##Remove chimeras
+
+the accuracy of sequence variants after denoising makes identifying chimeric ASVs simpler than when dealing with fuzzy OTUs. Chimeric sequences are identified if they can be exactly reconstructed by combining a left-segment and a right-segment from two more abundant “parent” sequences.
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+(Most of your reads should remain after chimera removal (it is not uncommon for a majority of sequence variants to be removed though). If most of your reads were removed as chimeric, upstream processing may need to be revisited. In almost all cases this is caused by primer sequences with ambiguous nucleotides that were not removed prior to beginning the DADA2 pipeline)
+
+```{r}
+tab1 <- head(seqtab_merged2[1:10])
+
+tab1 %>%
+     kbl(caption="Table 1: Summary Statistics of Financial Well-Being  
+                Score by Gender and Education",
+         format= "html",
+        col.names = colnames(tab1),
+         align="r") %>%
+     kable_classic(full_width = F, html_font = "helvetica")
+```
+
+
+##Track reads through the pipeline
+
+we’ll look at the number of reads that made it through each step in the pipeline:
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+This is a great place to do a last sanity check. Outside of filtering, there should no step in which a majority of reads are lost. If a majority of reads failed to merge, you may need to revisit the truncLen parameter used in the filtering step and make sure that the truncated reads span your amplicon. If a majority of reads were removed as chimeric, you may need to revisit the removal of primers, as the ambiguous nucleotides in unremoved primers interfere with chimera identification
+
+```{r}
+track %>%
+    kbl(caption="Table 2: Reads cleaned down the pipeline",
+         format= "html",
+         col.names = colnames(track),
+         align="r") %>%
+     kable_classic(full_width = F, html_font = "helvetica")
+```
+
+
+##Assign Taxonomy
+
+The dada2 package also implements a method to make species level assignments based on exact matching between ASVs and sequenced reference strains. Recent analysis suggests that exact matching (or 100% identity) is the only appropriate way to assign species to 16S gene fragments. Currently, species-assignment training fastas are available for the Silva and RDP 16S databases.
+
+```{r}
+
+silva_tax_levels <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+silva_file <- paste0('~/tfm/data/rawdata/', "silva_nr99_v138.1_train_set.fa.gz") # Paula, aquí en “database_dir” sería indicar tu directorio donde tienes la db
+
+
+#taxa <- assignTaxonomy(seqtab.nochim, "~/tfm/data/rawdata/silva_nr99_v138.1_train_set.fa
+taxa <- assignTaxonomy(seqtab.nochim, refFasta = silva_file, taxLevels = silva_tax_levels, minBoot = 0, outputBootstraps = FALSE, verbose = TRUE, multithread = TRUE)
+```
+
+```{r}
+# naive Bayesian classifier with dada2
+#taxa <- assignTaxonomy(seqtab.nochim, "~/tax/silva_nr_v128_train_set.fa.gz", multithread=TRUE) 
+# add species level assignments
+#taxa <- addSpecies(taxa, "~/tax/silva_species_assignment_v128.fa.gz")
+#if (!require("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+
+#BiocManager::install("DECIPHER")
+# use DECIPHER to classify
+library(DECIPHER); packageVersion("DECIPHER") # ‘2.8.1’
+#Download the SILVA SSU r132 (modified) file
+#system(wget www.decipher.codes/Classification/TrainingSets/SILVA_SSU_r132_March2018.RData)
+
+dna <- DNAStringSet(getSequences(seqtab.nochim)) # Create a DNAStringSet from the ASVs
+load("~/Downloads/SILVA_SSU_r132_March2018.RData") # CHANGE TO THE PATH OF YOUR TRAINING SET
+system.time(ids <- IdTaxa(dna, trainingSet, strand="top", processors=NULL, verbose=FALSE)) # use all processors (takes a while)
+#use strand="both" if reads not assigned taxonomies (everything is NA NA NA NA)
+#user    system   elapsed 
+#15902.051   160.796  1993.014 
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species") # ranks of interest
+# Convert the output object of class "Taxa" to a matrix analogous to the output from assignTaxonomy
+taxid <- t(sapply(ids, function(x) {
+  m <- match(ranks, x$rank)
+  taxa <- x$taxon[m]
+  taxa[startsWith(taxa, "unclassified_")] <- NA
+  taxa
+}))
+colnames(taxid) <- ranks; rownames(taxid) <- getSequences(seqtab.nochim)
+taxa <- taxid
+#view taxonomic assignments
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+#save.image(file="/home/cwm47/nader_sinusitus/urine_9-2018/dada2/nader_dada2.RData")
+```
+The taxid matrix from IdTaxa is a drop-in replacement for the taxa matrix from assignTaxonomy, simply set taxa <- taxid to carry on using the IdTaxa assignments. Read more about IdTaxa and other useful tools at the DECIPHER R package website.
+
+Alternatives: The recently developed IdTaxa taxonomic classification method is also available via the DECIPHER Bioconductor package. The paper introducing the IDTAXA algorithm reports classification performance that is better than the long-time standard set by the naive Bayesian classifier. Here we include a code block that allows you to use IdTaxa as a drop-in replacement for assignTaxonomy (and it’s faster as well!). Trained classifiers are available from http://DECIPHER.codes/Downloads.html. Download the SILVA SSU r132 (modified) file to follow along.
+
+##Filtering
+Prior to the downstream analysis, we excluded taxa (i) unassigned to the kingdom Bacteria; (ii) assigned to the kingdom Archaea, class Chloroplast, and family Mitochondria; and (iii) low in abundance (read counts ≤ 5 in ≤ 5 samples)
+
+# FLip table
+```{r}
+nrow(seqtab.nochim) #check the num of samples
+rownames(seqtab.nochim)[1:238]<-c(sample.names) #1:i where i is the num of samples
+seqtab.t <- as.data.frame(t(seqtab.nochim))
+```
+
+#Pull out ASV repset
+```{r}
+library(dplyr)
+
+repset_ASVs<- as.data.frame(rownames(seqtab.t))
+repset_ASVs <- mutate(repset_ASVs, ASV_ID=1:n())
+repset_ASVs$ASV_ID <- sub("^", "ASV_", repset_ASVs$ASV_ID)
+repset_ASVs$ASV <- repset_ASVs$`rownames(seqtab.t)`
+repset_ASVs$`rownames(seqtab.t)` <- NULL
+```
+
+# Add ASV numbers to table
+```{r}
+rownames(seqtab.t) <- repset_ASVs$ASV_ID
+seqtab.t <- mutate(seqtab.t, ASV_ID = 1:n())
+seqtab.t$ASV_ID <- sub("^", "ASV_", seqtab.t$ASV_ID)
+seqtab.t <- seqtab.t %>% select(ASV_ID, everything())
+```
+
+# Add ASV numbers to taxonomy and remove/rename columns
+```{r}
+taxonomy <- as.data.frame(taxa)
+taxonomy$ASV <- as.factor(rownames(taxonomy))
+taxonomy <- merge(repset_ASVs, taxonomy, by = "ASV")
+rownames(taxonomy) <- taxonomy$ASV_ID
+colnames(taxonomy)[3:8] <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus")
+taxonomy <- taxonomy[, -c(9:14)]
+```
+
+# Merge both tables
+```{r}
+seqtab_merged <- merge(seqtab.t, taxonomy, by = "ASV_ID")
+```
+With the function View() just the first 100 rows are shown
+
+# Filter eukaryotes, chloroplast and mitochondria (we keep Archaea as the primer pair is suitable)
+```{r}
+seqtab_merged$filter <- ifelse(seqtab_merged$Domain == "Archaea"
+                               | seqtab_merged$Order == "Chloroplast"
+                               | seqtab_merged$Family == "Mitochondria",
+                               "TRUE","FALSE")
+
+seqtab_merged <- seqtab_merged %>% mutate(filter = if_else(is.na(filter), "FALSE", filter))
+
+seqtab_merged2 <- subset(seqtab_merged, filter=="FALSE")
+```
+
+
+# Final merged tables
+```{r}
+seqtab_final <- subset(seqtab_merged2, select = -c(filter))
+taxonomy <- subset(seqtab_merged2, select = c(ASV_ID, ASV, Domain, Phylum, Class, Order, Family, Genus))
+seqtab.t <- subset(seqtab_merged2, select = c(1:239)) # 1:(n+1) where n is the number of samples
+taxonomy_edited <- subset(taxonomy, select=-c(ASV))
+
+write.table(taxonomy_edited, file="~/tfm/R/Tax_table.tsv", row.names = FALSE, sep = "\t", quote = TRUE)
+write.table(seqtab.t, file="~/tfm/R/ASV_table.tsv", row.names = FALSE, sep = "\t", quote = FALSE)
+```
+
+A mi personalmente me gusta guardarlas como archivos, pero no es necesario. Posteriormente, te recomiendo hacer una limpieza de dichas tablas antes de importarlas
+
+```{r}
+tab2 <- head(taxonomy_edited)
+tab2 %>%
+     kbl(caption="Table 2: Taxonomy table",
+        format= "html",
+         col.names = colnames(tab2),
+         align="r") %>%
+     kable_classic(full_width = F, html_font = "helvetica")
+
+```
+
+
+# Load raw data
+```{r}
+otu_mat_16S <- read.table("~/tfm/R/ASV_table.tsv", header = TRUE)     # ASVs
+row.names(otu_mat_16S) <- otu_mat_16S$ASV_ID
+otu_mat_16S <- otu_mat_16S[,-1]
+otu_mat_16S <- otu_mat_16S %>% mutate_if(is.integer, as.numeric)
+colnames(otu_mat_16S)
+
+tax_mat_16S <- read.table("~/tfm/R/Tax_table.tsv", header = TRUE)     # Taxonomy
+row.names(tax_mat_16S) <- tax_mat_16S$ASV_ID
+tax_mat_16S <- tax_mat_16S[,-c(1,2)]
+tax_mat_16S <- tax_mat_16S[-1, ]
+
+```
+
+# Transform into matrixes otu and tax tables
+```{r}
+otu_mat_16S <- as.matrix(otu_mat_16S)
+OTU_16S = otu_table(otu_mat_16S, taxa_are_rows = TRUE)
+
+tax_mat_16S <- as.matrix(tax_mat_16S)
+#tax_mat_16S <- subset(tax_mat_16S, select = -c(1))
+TAX_16S = tax_table(tax_mat_16S)
+```
+
+
+##Filter by read coount
+```{r}
+if(!requireNamespace("BiocManager")){
+  install.packages("BiocManager")
+}
+BiocManager::install("phyloseq")
+```
+
+# Phyloseq object
+```{r}
+#Import metadata
+library(readxl)
+filereport_read_run_PRJEB40100_tsv <- read_excel("~/Downloads/filereport_read_run_PRJEB40100_tsv.xls")
+View(filereport_read_run_PRJEB40100_tsv)
+```
+
+```{r}
+metadata <- as.data.frame(filereport_read_run_PRJEB40100_tsv)
+vector_names_OTU16S <- colnames(OTU_16S)
+filtered_metadata <- metadata[metadata$run_accession %in% vector_names_OTU16S, ]
+rownames(filtered_metadata) <- filtered_metadata$run_accession
+ncol(OTU_16S)
+nrow(filtered_metadata)
+```
+
+```{r}
+library(phyloseq)
+mic_phy_16S_raw <- phyloseq(OTU_16S, TAX_16S, sample_data(filtered_metadata))
+mic_phy_16S_raw
+```
+
+```{r}
+library(phyloseq); packageVersion("phyloseq")
+library(ggplot2); packageVersion("ggplot2")
+library(Biostrings); packageVersion("Biostrings")
+
+filter <- phyloseq::genefilter_sample(mic_phy_16S_raw, filterfun_sample(function(x) x >= 5),  A = 5)
+filtered_physeq <- prune_taxa(filter, mic_phy_16S_raw)
+View(filtered_physeq)
+
+```
+
+#Transform to relative abundance and reformat NAs
+```{r}
+rel_ab <- function(x){
+  # compute relative abundance
+  if (sum(x) == 0){
+    return(x)
+  } else {
+    return(100 * x/sum(x))
+  }
+}
+
+new_physeq <- transform_sample_counts(filtered_physeq, rel_ab)
+new_physeq@tax_table[new_physeq@tax_table[,3] %>% is.na(), 1:5] <- "UNKNOWN"
+```
+
+##Downstream
+Subsequently, the taxonomy table was agglomerated to the genus level, yielding 833 and 864 taxa for the soil (n = 112) and endosphere samples (n = 336), respectively. When the taxon was not classified at the genus level, it was labeled to the nearest classified taxonomic levels available. 
+
+```{r}
+genus_abundance <- filtered_physeq %>%
+  tax_glom(taxrank = "Genus") %>%                     # agglomerate at genus level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% # Transform to rel. abundance
+  psmelt() %>%                                         # Melt to long format
+  arrange(Genus) 
+head(genus_abundance)
+```
+```{r}
+tab4 <- head(select(genus_abundance, 'OTU','Sample','Abundance','scientific_name'))
+tab4 %>%
+     kbl(caption="Table 4: Genus abundance",
+         format= "html",
+         col.names = colnames(tab4),
+         align="r") %>%
+     kable_classic(full_width = F, html_font = "helvetica")
+```
+
+
+```{r}
+library(dplyr)
+filereport <- subset(filereport_read_run_PRJEB40100_tsv, select=c("run_accession", "scientific_name"))
+colnames(filereport)[1] ="Sample"
+joined_df <- merge(genus_abundance, filereport, by.x = "Sample", 
+             by.y = "Sample", all.x = TRUE, all.y = FALSE)
+taxa_soil <- joined_df[joined_df$scientific_name.x == 'soil metagenome', ]
+taxa_endosphere <- joined_df[joined_df$scientific_name.x == 'root metagenome', ]
+View(taxa_soil)
+View(taxa_endosphere)
+
+counts_soil <- taxa_soil %>% count(Phylum)
+counts_endosphere <- taxa_endosphere %>% count(Phylum)
+```
+
+#Export tables
+```{r}
+write.table(taxa_soil, file='~/tfm/R/taxa_soil.tsv', row.names = FALSE)
+write.table(taxa_endosphere, file='~/tfm/R/taxa_endosphere.tsv', row.names = FALSE)
+```
+
+#alpha Diversity
+```{r}
+library(microbiome)
+library(knitr)
+library(kableExtra)
+
+alfa <-microbiome::alpha(filtered_physeq, index = "all")
+alfa %>%
+     kbl(caption="Table 5: Alpha diversity",
+         format= "html",
+         col.names = colnames(alfa),
+         align="r") %>%
+     kable_classic(full_width = F, html_font = "helvetica")
+
+```
+
+```{r}
+
+
+
+
+```
+
+
+#Richness
+This returns observed richness with given detection threshold(s).
+```{r}
+rich <- richness(filtered_physeq)
+rich <- rich[order(rich$chao1, decreasing=T),]
+
+rich %>%
+     kbl(caption="Table 6: Observed richness",
+         format= "html",
+         col.names = colnames(rich),
+         align="r") %>%
+     kable_classic(full_width = F, html_font = "helvetica")
+
+```
+
+#Dominance
+The dominance index refers to the abundance of the most abundant species. Various dominance indices are available (see the function help for a list of options).
+```{r}
+# Absolute abundances for the single most abundant taxa in each sample
+dom <- dominance(filtered_physeq, index = "all")
+dom <- dom[order(dom$absolute, decreasing=T),]
+kable(head(dom))
+
+dom %>%
+     kbl(caption="Table 7: Abundance of the most abundant species",
+         format= "html",
+         col.names = colnames(dom),
+         align="r") %>%
+     kable_classic(full_width = F, html_font = "helvetica")
+```
+
+#Rarity and low abundance
+The rarity indices quantify the concentration of rare or low abundance taxa. Various rarity indices are available (see the function help for a list of options).
+```{r}
+rare <- rarity(filtered_physeq, index = "all")
+rare <- rare[order(rare$rare_abundance, decreasing=F),]
+kable(head(rare))
+
+rare%>%
+     kbl(caption="Table 8: concentration of low abundance taxa",
+         format= "html",
+         col.names = colnames(rare),
+         align="r") %>%
+     kable_classic(full_width = F, html_font = "helvetica")
+```
+
+#Visualization
+To visualize diversity measures, the package provides a simple wrapper around ggplot2. Currently onnly one measure can be visualized at a time.
+```{r}
+p.shannon <- boxplot_alpha(filtered_physeq, 
+                           index = "shannon",
+                           x_var = "scientific_name",
+                           fill.colors = c('root metagenome'="cyan4", 'soil metagenome'="deeppink4"))
+
+p.shannon <- p.shannon + theme_minimal() + 
+  labs(x="Sample", y="Shannon diversity") +
+  theme(axis.text = element_text(size=12),
+        axis.title = element_text(size=16),
+        legend.text = element_text(size=12),
+        legend.title = element_text(size=16))
+p.shannon
+```
+
+#Beta diversidad
+```{r}
+beta_diversity <- function(phy_obj, colorby, shapeby = NULL){ #colorby is the name of the metddata variable for which we will colour the plots
+  phylo_ord <- ordinate(phy_obj, method = "PCoA", distance = 'bray') 
+  p1 <- plot_ordination(phy_obj, phylo_ord, color = colorby, shape = shapeby )
+  p1 <- p1 + theme_classic() +
+    scale_color_brewer(palette = "Dark2") +
+    # geom_text(aes(label=colnames(otu_table(phy_obj)), hjust= 0, vjust = 2)) +
+    ggtitle("Beta Diversity - Bray-Curtis Distance") +
+    theme(plot.title = element_text(hjust = 0.5))
+    xlab('PCoA1 [14%]')
+    ylab('PCoA2 [17.9%]')
+  return(list( bray = p1))
+}
+
+bdiv <- beta_diversity(filtered_physeq, colorby = 'scientific_name', shapeby=NULL)
+```
+
+#Abundances
+```{r}
+plot_taxa_abundances <- function(phy_obj, facet_condition, taxonomic_rank = "phylum", plotlegend = T){
+  #extract data from physeq object
+  phy_subset <- tax_glom(phy_obj, taxrank = taxonomic_rank, NArm = F)
+  current_abundance <- data.frame(otu_table(phy_subset))
+  current_metadata <- data.frame(sample_data(phy_subset))
+  
+  #rename taxa
+  rownames(current_abundance) <- tax_table(phy_subset)[rownames(current_abundance), taxonomic_rank]
+  
+  #convert to long df format for plotting purposes
+  library(reshape2)
+  current_abundance <- data.frame(t(current_abundance))
+  current_abundance$sample <- rownames(current_abundance)
+  current_abundance$condition <- current_metadata[rownames(current_abundance), facet_condition]
+  current_abundance_long <- melt(current_abundance, id.vars = c("sample", "condition"))
+  colnames(current_abundance_long) <- c("sample", "condition", "taxa", "abundance")
+  
+  #set the palette to use depending on number of taxa
+  library(RColorBrewer)
+  getPalette <- colorRampPalette(brewer.pal(9, "Set1"))
+  final_palette <- getPalette(length(unique(current_abundance_long$taxa)))
+  
+  #plot
+  p <- ggplot(current_abundance_long, aes(x  = sample, fill = taxa, y = abundance)) +
+    geom_bar(stat = "identity") +
+    theme_classic() +
+    # theme(axis.text.x = element_text(angle = 90),
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          # axis.line.x = element_blank(),
+          axis.title.y = element_text(size = 16, face = "bold"), legend.title = element_text(size = 16, face = "bold"), 
+          # legend.text = element_text(size = 12, face = "bold", colour = "black"), 
+          axis.text.y = element_text(colour = "black", size = 8, face = "bold")) + 
+    # scale_y_continuous(expand = c(0,0)) + 
+    labs(x = "", y = "Relative Abundance (%)", fill = "Taxa") +
+    scale_fill_manual(values = final_palette) +
+    scale_y_continuous(expand = c(0,0)) +
+    facet_grid(~condition, scales = "free", space = "free")
+  
+  if (plotlegend == F) {
+    p <- p + theme(legend.position = "none")
+  }
+  
+  return(p)
+}
+
+tax_abund <- plot_taxa_abundances(new_physeq, 'scientific_name', taxonomic_rank = "Order", plotlegend = T)
+as_ggplot(get_legend(tax_abund))
+```
+
+
+
+##Infer Pathway abundances
+The functional potential of the endosphere community was predicted with Phylogenetic Investigation of Communities by Reconstruction of Unobserved States 2 (PICRUSt2-2.3.0_b) following to default parameters
+
+#Build OTU table for picrust2
+```{r}
+library(tidyr)
+OTU_soil = subset(taxa_soil, select=c("Sample", "OTU", "Abundance"))
+OTU_soil <- pivot_wider(OTU_soil, names_from="Sample", values_from="Abundance",id_cols="OTU")
+write.table(OTU_soil, file='~/tfm/R/OTU_soil.tsv', row.names = FALSE, sep = "\t")
+```
+
+```{r}
+OTU_endosphere = subset(taxa_endosphere, select=c("Sample", "OTU", "Abundance"))
+OTU_endosphere <- pivot_wider(OTU_endosphere, names_from="Sample", values_from="Abundance",id_cols="OTU")
+write.table(OTU_endosphere, file='~/tfm/R/OTU_endosphere.tsv', row.names = FALSE, sep = "\t")
+```
+
+#turn .tsv tables into .biom for picrust2 pipeline
+```{r}
+#Run in terminal
+biom convert -i OTU_soil.tsv -o OTU_soil_hdf5.biom --table-type="OTU table" --to-hdf5
+biom convert -i OTU_endosphere.tsv -o OTU_endosphere_hdf5.biom --table-type="OTU table" --to-hdf5
+```
+
+#Prepare FeatureData[Sequence] and FeatureTable[Frequency] 
+```{r}
+write.table(taxonomy, file="tax_table.tsv", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(seqtab.t, file="ASV_table.tsv", row.names = FALSE, sep = "\t", quote = FALSE)
+
+#Run in terminal
+biom convert -i ASV_table.tsv -o feature_table_hdf5.biom --table-type="OTU table" --to-hdf5
+biom convert -i tax_table.tsv -o feature_data_hdf5.biom --table-type="Gene table" --to-hdf5
+
+qiime tools import \
+  --input-path feature_table_hdf5.biom \
+  --type 'FeatureTable[Frequency]' \
+  --input-format BIOMV210Format \
+  --output-path feature_table.qza
+
+awk -F'\t' 'NR >1 {printf ">%s\n%s\n", $1, $2}' tax_table.tsv > feature_data.fasta
+
+qiime tools import \
+  --type 'FeatureData[Seuqence]' \
+  --input-path feature_data.fasta \
+  --output-path feature_data.qza
+```
+
+#Run picrust2 in terminal with qiime2
+```{r}
+#Run in terminal
+qiime picrust2 full-pipeline \
+   --i-table feature_table.qza \
+   --i-seq feature_data.qza \
+   --output-dir picrust2_output \
+   --p-placement-tool sepp \
+   --p-threads 1 \
+   --p-hsp-method pic \
+   --p-max-nsti 2 \
+   --verbose
+
+qiime feature-table summarize \
+   --i-table picrust2_output/pathway_abundance.qza \
+   --o-visualization picrust2_output/pathway_abundance.qzv
+```
+Note that this file is not in units of relative abundance (e.g. percent) and is instead the sum of the predicted functional abundance contributed by each ASV multiplied by the abundance (the number of input reads) of each ASV.
+
+## Filtering with KEGGs
+Prior to the downstream analysis, Kyoto Encyclopedia of Genes and Genomes (KEGG) Orthologs (KOs) included in KEGG pathways of human diseases were excluded. 
+```{r}
+library(readr)
+library(ggpicrust2)
+library(tibble)
+library(tidyverse)
+library(ggprism)
+library(patchwork)
+library(ORFik)
+
+##Run in terminal
+#qiime tools export --input-path ./picrust2_output/pathway_abundance.qza --output-path .
+#biom convert -i feature-table.biom -o abundance_file.tsv --to-tsv
+
+# Load necessary data: abundance data and metadata
+abundance_file <- "~/tfm/R/ko_metagenome.tsv"
+metadata <- read_delim(
+    "~/tfm/R/metadata.csv",
+    delim = ",",
+    escape_double = FALSE,
+    trim_ws = TRUE,
+    show_col_types = FALSE
+)
+
+
+```
+
+#Run ggpicrust2
+```{r}
+results_file_input <- ggpicrust2(file = abundance_file,
+                                 metadata = metadata,
+                                 group = "ScientificName", # For example dataset, group = "Environment"
+                                 pathway = "KO",
+                                 daa_method = "edgeR",
+                                 ko_to_kegg = TRUE,
+                                 order = "pathway_class",
+                                 p_values_bar = TRUE,
+                                 x_lab = "pathway_name")
+                        
+```
+```{r}
+# Use case 1: Annotating pathway information using the output file from PICRUSt2
+result1 <- pathway_annotation(file = "~/tfm/R/ko_metagenome.tsv",
+pathway = "KO",
+daa_results_df = NULL,
+ko_to_kegg = TRUE)
+
+kegg_abundance <- ko2kegg_abundance(file = "~/tfm/R/ko_metagenome.tsv")
+
+```
+```{r}
+daa_results_df <- pathway_daa(abundance = kegg_abundance, metadata = metadata, group = "ScientificName", daa_method = "ALDEx2", select = NULL, reference = NULL)
+```
+
+# Filter results for ALDEx2_Welch's t test method
+# Please check the unique(daa_results_df$method) and choose one
+```{r}
+daa_sub_method_results_df <- daa_results_df[daa_results_df$method == "ALDEx2_Wilcoxon rank test", ]
+```
+
+# Annotate pathway results using KO to KEGG conversion
+```{r}
+daa_annotated_sub_method_results_df <- pathway_annotation(pathway = "KO", daa_results_df = daa_sub_method_results_df, ko_to_kegg = TRUE)
+```
+# Generate pathway error bar plot
+# Please change Group to metadata$your_group_column if you are not using example dataset
+```{r}
+library(patchwork)
+
+p <- pathway_errorbar(abundance = kegg_abundance, daa_results_df = daa_annotated_sub_method_results_df, Group = metadata$ScientificName, p_values_threshold = 0.05, order = "pathway_class", select = NULL, ko_to_kegg = TRUE, p_value_bar = TRUE, colors = NULL, x_lab = "pathway_name")
+```
+not finding significant results is also a result and can be informative, as it might indicate that there are no substantial differences between the groups you’re studying. It’s important to interpret your results in the context of your specific study and not to force statistical significance where there isn’t any.
+
+##Eliminar KEGGS asociados a enfermedades humanas
+```{r}
+library(KEGGREST)
+
+column_one <- as.vector(result1$`OTU ID`)
+human_diseases <- list()
+for (n in column_one){
+  r <- keggLink('disease', n)
+  if (length(r)!=0){
+    human_diseases <- append(human_diseases, r)
+    }
+  }
+
+```
+
+```{r}
+hd_names<-names(human_diseases)
+human_diseases_ids <- gsub('ko:',"",hd_names)
+ko_not_diseases <- result1[result1$'OTU ID' %in% human_diseases_ids, ] 
+head(ko_not_diseases)
+```
+
+#Repetimos calculos anteriores sin estos KEGGS
+```{r}
+library(patchwork)
+
+q <- pathway_errorbar(abundance = ko_not_diseases, daa_results_df = daa_annotated_sub_method_results_df, Group = metadata$ScientificName, p_values_threshold = 0.05, order = "pathway_class", select = NULL, ko_to_kegg = TRUE, p_value_bar = TRUE, colors = NULL, x_lab = "pathway_name")
+```
+
+
+
+
+
